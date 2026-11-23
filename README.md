@@ -29,12 +29,13 @@ AI marketing assistant for beauty businesses, backed by PostgreSQL, Prisma ORM, 
    docker compose up -d
    ```
 
-3. Install dependencies, apply Prisma migrations, and start the app:
+3. Install dependencies, apply Prisma migrations, seed the demo client, and start the app:
 
    ```bash
    npm install
-   npx prisma migrate deploy
+   npm run db:setup
    npm run dev
    ```
 
    Open [http://localhost:3000](http://localhost:3000).
+   Demo client login created by seed: `demo@beautycontent.local` / `DemoPassword123!`.
