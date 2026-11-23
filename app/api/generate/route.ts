@@ -1,10 +1,12 @@
 import { NextResponse } from "next/server";
 
-import { buildProjectContentPrompt, ProjectContentPromptError } from "@/lib/prompts/project-content";
-import { createClient } from "@/lib/supabase/server";
 import { ContentProviderError } from "@/lib/ai/provider";
+import { getSession } from "@/lib/auth/session";
+import { prisma } from "@/lib/db/prisma";
 import { generateProjectContent as generateGeminiContent } from "@/lib/gemini/client";
 import { generateProjectContent as generateOpenAiContent } from "@/lib/openai/client";
+import { reserveDailyGenerationAttempt } from "@/lib/projects/quota";
+import { buildProjectContentPrompt, ProjectContentPromptError } from "@/lib/prompts/project-content";
 import { GeneratedContentValidationError, parseGeneratedContent } from "@/lib/validation/generated-content";
 
 const projectIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -36,7 +38,7 @@ function parseQuotaReservation(value: unknown): {
     || remainingAttempts < 0
     || remainingAttempts > dailyGenerationLimit
     || typeof reservation.reset_at !== "string"
-    || !/^\d{4}-\d{2}-\d{2}T00:00:00(?:\.0+)?(?:Z|\+00:00)$/.test(reservation.reset_at)
+    || !/^\d{4}-\d{2}-\d{2}T00:00:00(?:\.\d+)?(?:Z|\+00:00)$/.test(reservation.reset_at)
   ) {
     return null;
   }
@@ -69,11 +71,19 @@ function parseQuotaReservation(value: unknown): {
 
 function safeTokenCount(value: number | null): number | null {
   return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= 0 &&
-    value <= maxDatabaseInteger
+    typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= 0
+    && value <= maxDatabaseInteger
   ) ? value : null;
+}
+
+function toRevisionIso(value: Date | string): string | null {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+  }
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 function getNextRevision(currentRevision: string): string | null {
@@ -106,70 +116,100 @@ export async function POST(request: Request) {
   }
 
   if (
-    !isRecord(body) ||
-    Object.keys(body).length !== 1 ||
-    typeof body.projectId !== "string" ||
-    !projectIdPattern.test(body.projectId)
+    !isRecord(body)
+    || Object.keys(body).length !== 1
+    || typeof body.projectId !== "string"
+    || !projectIdPattern.test(body.projectId)
   ) {
     return errorResponse("invalid_request", "Provide a valid project ID.", 400);
   }
 
-  let supabase;
+  let session;
   try {
-    supabase = await createClient();
+    session = await getSession();
   } catch {
-    return errorResponse("server_configuration", "The service is temporarily unavailable.", 503);
-  }
-
-  const { data: claims, error: claimsError } = await supabase.auth.getClaims();
-  if (claimsError) {
     return errorResponse("authentication_unavailable", "Authentication is temporarily unavailable.", 503);
   }
 
-  const userId = typeof claims?.claims?.sub === "string" ? claims.claims.sub : null;
+  const userId = session?.userId ?? null;
   if (!userId) {
     return errorResponse("unauthenticated", "Sign in to generate project content.", 401);
   }
 
-  const { data: project, error: projectError } = await supabase
-    .from("projects")
-    .select("id, user_id, business_id, type, goal, title, updated_at")
-    .eq("id", body.projectId)
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  if (projectError) {
+  let project;
+  try {
+    project = await prisma.project.findFirst({
+      where: { id: body.projectId, userId },
+      select: {
+        id: true,
+        userId: true,
+        businessId: true,
+        type: true,
+        goal: true,
+        title: true,
+        updatedAt: true,
+      },
+    });
+  } catch {
     return errorResponse("project_unavailable", "The project could not be loaded.", 500);
   }
+
   if (!project) {
     return errorResponse("project_not_found", "Project not found.", 404);
   }
-  if (typeof project.updated_at !== "string") {
+
+  const currentRevision = toRevisionIso(project.updatedAt);
+  if (!currentRevision) {
     return errorResponse("project_unavailable", "The project revision could not be verified.", 500);
   }
 
-  const { data: business, error: businessError } = await supabase
-    .from("businesses")
-    .select("id, user_id, name, industry, city, description, target_audience, tone_of_voice, brand_description, brand_advantages, preferred_phrases, forbidden_phrases")
-    .eq("id", project.business_id)
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  if (businessError) {
+  let business;
+  try {
+    business = await prisma.business.findFirst({
+      where: { id: project.businessId, userId },
+      select: {
+        id: true,
+        userId: true,
+        name: true,
+        industry: true,
+        city: true,
+        description: true,
+        targetAudience: true,
+        toneOfVoice: true,
+        brandDescription: true,
+        brandAdvantages: true,
+        preferredPhrases: true,
+        forbiddenPhrases: true,
+      },
+    });
+  } catch {
     return errorResponse("business_unavailable", "Business context could not be loaded.", 500);
   }
+
   if (!business) {
     return errorResponse("business_context_invalid", "The project has no available Business Profile.", 422);
   }
 
-  const { data: services, error: servicesError } = await supabase
-    .from("services")
-    .select("name, description, price, currency")
-    .eq("business_id", business.id)
-    .order("created_at", { ascending: true })
-    .limit(8);
-
-  if (servicesError) {
+  let services;
+  try {
+    const rows = await prisma.service.findMany({
+      where: { businessId: business.id },
+      orderBy: { createdAt: "asc" },
+      take: 8,
+      select: {
+        name: true,
+        description: true,
+        price: true,
+        currency: true,
+      },
+    });
+    services = rows.map((row) => ({
+      name: row.name,
+      description: row.description,
+      price: row.price !== null ? Number(row.price) : null,
+      currency: row.currency,
+    }));
+  } catch {
     return errorResponse("business_context_unavailable", "Business services could not be loaded.", 500);
   }
 
@@ -186,12 +226,12 @@ export async function POST(request: Request) {
         industry: business.industry,
         city: business.city,
         description: business.description,
-        target_audience: business.target_audience,
-        tone_of_voice: business.tone_of_voice,
-        brand_description: business.brand_description,
-        brand_advantages: business.brand_advantages,
-        preferred_phrases: business.preferred_phrases,
-        forbidden_phrases: business.forbidden_phrases,
+        target_audience: business.targetAudience,
+        tone_of_voice: business.toneOfVoice,
+        brand_description: business.brandDescription,
+        brand_advantages: business.brandAdvantages,
+        preferred_phrases: business.preferredPhrases,
+        forbidden_phrases: business.forbiddenPhrases,
       },
       services,
     });
@@ -209,16 +249,12 @@ export async function POST(request: Request) {
 
   let reservationResult;
   try {
-    reservationResult = await supabase.rpc("reserve_daily_generation_attempt");
+    reservationResult = await reserveDailyGenerationAttempt(userId);
   } catch {
     return errorResponse("generation_quota_unavailable", "Generation is temporarily unavailable. Please try again.", 503);
   }
 
-  if (!isRecord(reservationResult) || reservationResult.error) {
-    return errorResponse("generation_quota_unavailable", "Generation is temporarily unavailable. Please try again.", 503);
-  }
-
-  const reservation = parseQuotaReservation(reservationResult.data);
+  const reservation = parseQuotaReservation(reservationResult);
   if (!reservation) {
     return errorResponse("generation_quota_unavailable", "Generation is temporarily unavailable. Please try again.", 503);
   }
@@ -272,54 +308,59 @@ export async function POST(request: Request) {
   }
 
   const serializedContent = JSON.stringify(generatedContent);
-  const nextRevision = getNextRevision(project.updated_at);
+  const nextRevision = getNextRevision(currentRevision);
   if (!nextRevision) {
     return errorResponse("project_unavailable", "The project revision could not be verified.", 500);
   }
 
-  const { data: updatedProject, error: updateError } = await supabase
-    .from("projects")
-    .update({
-      prompt: prompt.prompt,
-      content: serializedContent,
-      updated_at: nextRevision,
-    })
-    .eq("id", project.id)
-    .eq("user_id", userId)
-    .eq("updated_at", project.updated_at)
-    .select("id, updated_at")
-    .maybeSingle();
-
-  if (updateError) {
+  let updatedCount: number;
+  try {
+    const updated = await prisma.project.updateMany({
+      where: {
+        id: project.id,
+        userId,
+        updatedAt: project.updatedAt instanceof Date ? project.updatedAt : new Date(currentRevision),
+      },
+      data: {
+        prompt: prompt.prompt,
+        content: serializedContent,
+        updatedAt: new Date(nextRevision),
+      },
+    });
+    updatedCount = updated.count;
+  } catch {
     return errorResponse("project_persistence_failed", "Generated content could not be saved to the project.", 500);
   }
-  if (!updatedProject) {
+
+  if (updatedCount === 0) {
     return errorResponse(
       "project_content_conflict",
       "This project changed while content was generating. Refresh and try again.",
       409,
     );
   }
-  if (typeof updatedProject.updated_at !== "string") {
-    return errorResponse("project_unavailable", "The saved project revision could not be verified.", 500);
-  }
 
   const model = providerResult.model;
-  const { error: generationError } = await supabase.from("generations").insert({
-    project_id: project.id,
-    model,
-    input_tokens: safeTokenCount(providerResult.inputTokens),
-    output_tokens: safeTokenCount(providerResult.outputTokens),
-  });
+  const inputTokens = safeTokenCount(providerResult.inputTokens);
+  const outputTokens = safeTokenCount(providerResult.outputTokens);
 
-  if (generationError) {
+  try {
+    await prisma.generation.create({
+      data: {
+        projectId: project.id,
+        model,
+        inputTokens,
+        outputTokens,
+      },
+    });
+  } catch {
     return NextResponse.json({
       result: generatedContent,
-      revision: updatedProject.updated_at,
+      revision: nextRevision,
       generation: {
         model,
-        inputTokens: safeTokenCount(providerResult.inputTokens),
-        outputTokens: safeTokenCount(providerResult.outputTokens),
+        inputTokens,
+        outputTokens,
         metadataRecorded: false,
       },
       warning: {
@@ -331,11 +372,11 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     result: generatedContent,
-    revision: updatedProject.updated_at,
+    revision: nextRevision,
     generation: {
       model,
-      inputTokens: safeTokenCount(providerResult.inputTokens),
-      outputTokens: safeTokenCount(providerResult.outputTokens),
+      inputTokens,
+      outputTokens,
       metadataRecorded: true,
     },
   });

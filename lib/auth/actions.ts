@@ -1,10 +1,11 @@
 "use server";
 
-import { headers } from "next/headers";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
-import { createClient } from "@/lib/supabase/server";
+import { hashPassword, verifyPassword } from "@/lib/auth/password";
+import { clearSessionCookie, setSessionCookie } from "@/lib/auth/session";
+import { prisma } from "@/lib/db/prisma";
 
 export type AuthActionState = {
   error?: string;
@@ -22,6 +23,15 @@ function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
+function isPrismaUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error as { code?: unknown }).code === "P2002"
+  );
+}
+
 export async function signIn(
   _previousState: AuthActionState,
   formData: FormData,
@@ -33,18 +43,28 @@ export async function signIn(
     return { error: "Enter a valid email address and password." };
   }
 
-  const supabase = await createClient();
-  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  let user: { id: string; email: string; passwordHash: string } | null;
+  try {
+    user = await prisma.user.findUnique({
+      where: { email },
+      select: { id: true, email: true, passwordHash: true },
+    });
+  } catch {
+    return { error: genericAuthErrorMessage };
+  }
 
-  if (error) {
-    if (error.message.toLowerCase().includes("email not confirmed")) {
-      return { error: "Please confirm your email before signing in." };
-    }
+  if (!user) {
+    return { error: invalidCredentialsMessage };
+  }
 
-    if (error.status === 400 || error.message.toLowerCase().includes("invalid login")) {
-      return { error: invalidCredentialsMessage };
-    }
+  const passwordValid = await verifyPassword(password, user.passwordHash);
+  if (!passwordValid) {
+    return { error: invalidCredentialsMessage };
+  }
 
+  try {
+    await setSessionCookie({ id: user.id, email: user.email });
+  } catch {
     return { error: genericAuthErrorMessage };
   }
 
@@ -72,34 +92,46 @@ export async function signUp(
     return { error: "Passwords do not match." };
   }
 
-  const requestHeaders = await headers();
-  const origin = requestHeaders.get("origin");
-  const supabase = await createClient();
-  const { error } = await supabase.auth.signUp({
-    email,
-    password,
-    options: origin ? { emailRedirectTo: `${origin}/auth/confirm` } : undefined,
-  });
-
-  if (error) {
-    if (error.message.toLowerCase().includes("already registered")) {
-      return { error: "An account with this email already exists. Try signing in." };
-    }
-
+  let passwordHash: string;
+  try {
+    passwordHash = await hashPassword(password);
+  } catch {
     return { error: genericAuthErrorMessage };
   }
 
-  return { success: true };
+  let createdUser: { id: string; email: string };
+  try {
+    const existing = await prisma.user.findUnique({
+      where: { email },
+      select: { id: true },
+    });
+    if (existing) {
+      return { error: "An account with this email already exists. Try signing in." };
+    }
+
+    createdUser = await prisma.user.create({
+      data: { email, passwordHash },
+      select: { id: true, email: true },
+    });
+  } catch (error) {
+    if (isPrismaUniqueConstraintError(error)) {
+      return { error: "An account with this email already exists. Try signing in." };
+    }
+    return { error: genericAuthErrorMessage };
+  }
+
+  try {
+    await setSessionCookie(createdUser);
+  } catch {
+    return { error: genericAuthErrorMessage };
+  }
+
+  revalidatePath("/", "layout");
+  redirect("/dashboard");
 }
 
 export async function signOut(): Promise<void> {
-  const supabase = await createClient();
-  const { error } = await supabase.auth.signOut();
-
-  if (error) {
-    throw new Error("Unable to sign out.");
-  }
-
+  await clearSessionCookie();
   revalidatePath("/", "layout");
   redirect("/login");
 }

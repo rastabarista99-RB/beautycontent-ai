@@ -2,7 +2,8 @@
 
 import { revalidatePath } from "next/cache";
 
-import { createClient } from "@/lib/supabase/server";
+import { getSession } from "@/lib/auth/session";
+import { prisma } from "@/lib/db/prisma";
 
 export type BusinessActionState = {
   error?: string;
@@ -21,15 +22,12 @@ function getOptionalText(formData: FormData, name: string): string | null {
 }
 
 async function getAuthenticatedUserId(): Promise<{ id: string } | { error: string }> {
-  const supabase = await createClient();
-  const { data, error } = await supabase.auth.getClaims();
-  const userId = typeof data?.claims?.sub === "string" ? data.claims.sub : null;
-
-  if (error || !userId) {
+  const session = await getSession();
+  if (!session?.userId) {
     return { error: "Your session has expired. Please sign in again." };
   }
 
-  return { id: userId };
+  return { id: session.userId };
 }
 
 export async function saveBusiness(
@@ -44,24 +42,27 @@ export async function saveBusiness(
     return { error: "Enter your business name." };
   }
 
-  const supabase = await createClient();
   const values = {
-    user_id: user.id,
     name,
     city: getOptionalText(formData, "city"),
     description: getOptionalText(formData, "description"),
-    target_audience: getOptionalText(formData, "targetAudience"),
-    tone_of_voice: getOptionalText(formData, "toneOfVoice"),
-    brand_advantages: getOptionalText(formData, "brandAdvantages"),
-    preferred_phrases: getOptionalText(formData, "preferredPhrases"),
-    forbidden_phrases: getOptionalText(formData, "forbiddenPhrases"),
+    targetAudience: getOptionalText(formData, "targetAudience"),
+    toneOfVoice: getOptionalText(formData, "toneOfVoice"),
+    brandAdvantages: getOptionalText(formData, "brandAdvantages"),
+    preferredPhrases: getOptionalText(formData, "preferredPhrases"),
+    forbiddenPhrases: getOptionalText(formData, "forbiddenPhrases"),
   };
 
-  const { error } = await supabase
-    .from("businesses")
-    .upsert(values, { onConflict: "user_id" });
-
-  if (error) {
+  try {
+    await prisma.business.upsert({
+      where: { userId: user.id },
+      create: {
+        userId: user.id,
+        ...values,
+      },
+      update: values,
+    });
+  } catch {
     return { error: genericBusinessError };
   }
 
@@ -94,32 +95,45 @@ export async function saveService(
     return { error: "Choose a supported currency." };
   }
 
-  const supabase = await createClient();
-  const { data: business, error: businessError } = await supabase
-    .from("businesses")
-    .select("id")
-    .eq("id", businessId)
-    .eq("user_id", user.id)
-    .maybeSingle();
+  let business: { id: string } | null;
+  try {
+    business = await prisma.business.findFirst({
+      where: { id: businessId, userId: user.id },
+      select: { id: true },
+    });
+  } catch {
+    return { error: "We could not verify this business." };
+  }
 
-  if (businessError || !business) {
+  if (!business) {
     return { error: "We could not verify this business." };
   }
 
   const values = {
-    business_id: business.id,
     name,
     description: getOptionalText(formData, "description"),
     price: priceText,
     currency,
   };
 
-  const query = serviceId
-    ? supabase.from("services").update(values).eq("id", serviceId).eq("business_id", business.id)
-    : supabase.from("services").insert(values);
-  const { error } = await query;
-
-  if (error) {
+  try {
+    if (serviceId) {
+      const updated = await prisma.service.updateMany({
+        where: { id: serviceId, businessId: business.id },
+        data: values,
+      });
+      if (updated.count === 0) {
+        return { error: genericBusinessError };
+      }
+    } else {
+      await prisma.service.create({
+        data: {
+          businessId: business.id,
+          ...values,
+        },
+      });
+    }
+  } catch {
     return { error: genericBusinessError };
   }
 
@@ -137,25 +151,28 @@ export async function deleteService(formData: FormData): Promise<BusinessActionS
     return { error: "We could not identify that service." };
   }
 
-  const supabase = await createClient();
-  const { data: business, error: businessError } = await supabase
-    .from("businesses")
-    .select("id")
-    .eq("id", businessId)
-    .eq("user_id", user.id)
-    .maybeSingle();
-
-  if (businessError || !business) {
+  let business: { id: string } | null;
+  try {
+    business = await prisma.business.findFirst({
+      where: { id: businessId, userId: user.id },
+      select: { id: true },
+    });
+  } catch {
     return { error: "We could not verify this business." };
   }
 
-  const { error } = await supabase
-    .from("services")
-    .delete()
-    .eq("id", serviceId)
-    .eq("business_id", business.id);
+  if (!business) {
+    return { error: "We could not verify this business." };
+  }
 
-  if (error) {
+  try {
+    const deleted = await prisma.service.deleteMany({
+      where: { id: serviceId, businessId: business.id },
+    });
+    if (deleted.count === 0) {
+      return { error: genericBusinessError };
+    }
+  } catch {
     return { error: genericBusinessError };
   }
 

@@ -33,85 +33,89 @@ require.extensions[".tsx"] = (module, filename) => {
   module._compile(outputText, filename);
 };
 
-class MockQuery {
-  constructor(table) {
-    this.table = table;
-    this.filters = [];
-    this.action = "select";
-    state.queries.push(this);
-  }
-
-  select(columns) {
-    this.columns = columns;
-    return this;
-  }
-
-  eq(column, value) {
-    this.filters.push([column, value]);
-    return this;
-  }
-
-  order() {
-    return this;
-  }
-
-  limit(count) {
-    this.limitCount = count;
-    return this;
-  }
-
-  update(values) {
-    this.action = "update";
-    this.values = values;
-    return this;
-  }
-
-  insert(values) {
-    this.action = "insert";
-    this.values = values;
-    return this;
-  }
-
-  maybeSingle() {
-    return Promise.resolve(this.result());
-  }
-
-  then(resolve, reject) {
-    return Promise.resolve(this.result()).then(resolve, reject);
-  }
-
-  result() {
-    if (this.table === "projects" && this.action === "select") {
-      return { data: state.project, error: state.projectError };
-    }
-    if (this.table === "projects" && this.action === "update") {
-      state.projectUpdate = this.values;
-      state.projectUpdateFilters = this.filters;
-      const revisionFilter = this.filters.find(([column]) => column === "updated_at");
-      const revisionMatches = !revisionFilter || revisionFilter[1] === state.project?.updated_at;
-      if (state.updateReturnsRow && revisionMatches && state.project && !state.updateError) {
-        state.project = { ...state.project, ...this.values };
-        return {
-          data: { id: state.project.id, updated_at: state.project.updated_at },
-          error: state.updateError,
-        };
-      }
-      return { data: null, error: state.updateError };
-    }
-    if (this.table === "businesses") {
-      return { data: state.business, error: state.businessError };
-    }
-    if (this.table === "services") {
-      state.servicesLimit = this.limitCount;
-      return { data: state.services, error: state.servicesError };
-    }
-    if (this.table === "generations") {
-      state.generationInsert = this.values;
-      return { data: null, error: state.generationError };
-    }
-    throw new Error(`Unexpected database operation: ${this.table}/${this.action}`);
-  }
+function toIso(value) {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string") return new Date(Date.parse(value)).toISOString();
+  return null;
 }
+
+const mockPrisma = {
+  project: {
+    async findFirst(args) {
+      state.queries.push({ table: "projects", action: "select", ...args });
+      if (state.projectError) throw state.projectError;
+      if (!state.project) return null;
+      return {
+        id: state.project.id,
+        userId: state.project.user_id,
+        businessId: state.project.business_id,
+        type: state.project.type,
+        goal: state.project.goal,
+        title: state.project.title,
+        content: state.project.content ?? null,
+        status: state.project.status ?? "saved",
+        createdAt: state.project.created_at ?? "2026-10-09T09:00:00.000Z",
+        updatedAt: state.project.updated_at,
+      };
+    },
+    async updateMany(args) {
+      state.queries.push({ table: "projects", action: "update", ...args });
+      state.projectUpdate = args.data;
+      state.projectUpdateWhere = args.where;
+      if (state.updateError) throw state.updateError;
+      const expectedIso = args.where?.updatedAt ? toIso(args.where.updatedAt) : null;
+      const currentIso = state.project?.updated_at ? toIso(state.project.updated_at) : null;
+      const revisionMatches = !expectedIso || expectedIso === currentIso;
+      if (state.updateReturnsRow && revisionMatches && state.project) {
+        const nextIso = toIso(args.data.updatedAt);
+        state.project = {
+          ...state.project,
+          ...args.data,
+          updated_at: nextIso,
+        };
+        return { count: 1 };
+      }
+      return { count: 0 };
+    },
+  },
+  business: {
+    async findFirst(args) {
+      state.queries.push({ table: "businesses", action: "select", ...args });
+      if (state.businessError) throw state.businessError;
+      if (!state.business) return null;
+      return {
+        id: state.business.id,
+        userId: state.business.user_id,
+        name: state.business.name,
+        industry: state.business.industry,
+        city: state.business.city,
+        description: state.business.description,
+        targetAudience: state.business.target_audience,
+        toneOfVoice: state.business.tone_of_voice,
+        brandDescription: state.business.brand_description,
+        brandAdvantages: state.business.brand_advantages,
+        preferredPhrases: state.business.preferred_phrases,
+        forbiddenPhrases: state.business.forbidden_phrases,
+      };
+    },
+  },
+  service: {
+    async findMany(args) {
+      state.queries.push({ table: "services", action: "select", ...args });
+      state.servicesLimit = args.take;
+      if (state.servicesError) throw state.servicesError;
+      return state.services;
+    },
+  },
+  generation: {
+    async create(args) {
+      state.queries.push({ table: "generations", action: "insert", ...args });
+      if (state.generationError) throw state.generationError;
+      state.generationInsert = args.data;
+      return { id: "gen-1", ...args.data };
+    },
+  },
+};
 
 class ProviderError extends Error {
   constructor(category) {
@@ -243,8 +247,27 @@ Module._load = function (request, parent, isMain) {
   if (request === "@/components/projects/project-delete-button") {
     return { ProjectDeleteButton: ProjectDeleteButtonStub };
   }
-  if (request === "@/lib/supabase/server") {
-    return { createClient: async () => state.supabase };
+  if (request === "@/lib/auth/session") {
+    return {
+      getSession: async () => (state.authenticated
+        ? { userId: "user-a", email: "user@example.com" }
+        : null),
+    };
+  }
+  if (request === "@/lib/db/prisma") {
+    return { prisma: mockPrisma };
+  }
+  if (request === "@/lib/projects/quota") {
+    return {
+      reserveDailyGenerationAttempt: async (userId) => {
+        state.quotaCalls.push({ name: "reserve_daily_generation_attempt", args: userId });
+        state.events.push("reservation");
+        if (state.quotaRpcThrows) throw new Error("private RPC failure");
+        if (state.quotaMalformedEnvelope) return null;
+        if (state.quotaError) throw state.quotaError;
+        return state.quotaResult;
+      },
+    };
   }
   if (request === "@/app/(app)/projects/actions") {
     return { saveEditedGeneratedContent: (input) => state.saveAction(input) };
@@ -369,28 +392,13 @@ function reset(overrides = {}) {
       usageMetadata: { promptTokenCount: 42, candidatesTokenCount: 18, thoughtsTokenCount: 5 },
     },
     projectUpdate: null,
-    projectUpdateFilters: null,
+    projectUpdateWhere: null,
     saveAction: async () => ({ ok: false, code: "unavailable", message: "Save failed." }),
     revalidatedPath: null,
     generationInsert: null,
     servicesLimit: null,
     refreshCalls: 0,
     queries: [],
-    supabase: {
-      auth: {
-        getClaims: async () => state.authenticated
-          ? { data: { claims: { sub: "user-a" } }, error: null }
-          : { data: { claims: null }, error: null },
-      },
-      rpc: async (name, args) => {
-        state.quotaCalls.push({ name, args });
-        state.events.push("reservation");
-        if (state.quotaRpcThrows) throw new Error("private RPC failure");
-        if (state.quotaMalformedEnvelope) return null;
-        return { data: state.quotaResult, error: state.quotaError };
-      },
-      from: (table) => new MockQuery(table),
-    },
     ...stateOverrides,
   });
   provider.error = null;
@@ -610,11 +618,11 @@ test("treats malformed saved content as unavailable and passes valid saved conte
     params: Promise.resolve({ id: "123e4567-e89b-12d3-a456-426614174000" }),
   });
   let query = state.queries.find((item) => item.table === "projects");
-  assert.match(query.columns, /\bcontent\b/);
-  assert.deepEqual(query.filters, [
-    ["id", "123e4567-e89b-12d3-a456-426614174000"],
-    ["user_id", "user-a"],
-  ]);
+  assert.equal(query.select.content, true);
+  assert.deepEqual(query.where, {
+    id: "123e4567-e89b-12d3-a456-426614174000",
+    userId: "user-a",
+  });
   assert.equal(findElementByType(page, ProjectGeneration).props.savedContent, null);
   assert.ok(findElementByType(page, ProjectFormStub));
   assert.ok(findElementByType(page, ProjectDeleteButtonStub));
@@ -690,19 +698,19 @@ test("saves edited content with verified ownership, preserved metadata, and revi
   assert.ok(Date.parse(result.revision) > Date.parse("2026-10-09T10:00:00.000Z"));
   assert.deepEqual(state.projectUpdate, {
     content: JSON.stringify(result.content),
-    updated_at: result.revision,
+    updatedAt: new Date(result.revision),
   });
   const updateQuery = state.queries.find((query) => query.table === "projects" && query.action === "update");
-  assert.deepEqual(updateQuery.filters, [
-    ["id", "123e4567-e89b-12d3-a456-426614174000"],
-    ["user_id", "user-a"],
-    ["updated_at", "2026-10-09T10:00:00.000Z"],
-  ]);
-  assert.deepEqual(state.queries[0].filters, [
-    ["id", "123e4567-e89b-12d3-a456-426614174000"],
-    ["user_id", "user-a"],
-  ]);
-  assert.deepEqual(Object.keys(state.projectUpdate).sort(), ["content", "updated_at"]);
+  assert.deepEqual(updateQuery.where, {
+    id: "123e4567-e89b-12d3-a456-426614174000",
+    userId: "user-a",
+    updatedAt: new Date("2026-10-09T10:00:00.000Z"),
+  });
+  assert.deepEqual(state.queries[0].where, {
+    id: "123e4567-e89b-12d3-a456-426614174000",
+    userId: "user-a",
+  });
+  assert.deepEqual(Object.keys(state.projectUpdate).sort(), ["content", "updatedAt"]);
   assert.equal(state.revalidatedPath, "/projects/123e4567-e89b-12d3-a456-426614174000");
   assert.equal(state.generationInsert, null);
   assert.equal(provider.calls.length, 0);
@@ -1792,11 +1800,11 @@ test("selects Gemini explicitly, defaults to OpenAI when unset, and rejects unkn
   const geminiProjectUpdate = state.queries.find(
     (query) => query.table === "projects" && query.action === "update",
   );
-  assert.deepEqual(geminiProjectUpdate.filters, [
-    ["id", "project-a"],
-    ["user_id", "user-a"],
-    ["updated_at", "2026-10-09T10:00:00.000Z"],
-  ]);
+  assert.deepEqual(geminiProjectUpdate.where, {
+    id: "project-a",
+    userId: "user-a",
+    updatedAt: new Date("2026-10-09T10:00:00.000Z"),
+  });
 
   reset({ aiProvider: null });
   response = await post({ projectId: "123e4567-e89b-12d3-a456-426614174000" });
@@ -1817,10 +1825,10 @@ test("returns the same not-found response for absent and inaccessible projects",
   const response = await post({ projectId: "123e4567-e89b-12d3-a456-426614174000" });
   assert.equal(response.status, 404);
   assert.equal((await responseJson(response)).error.code, "project_not_found");
-  assert.deepEqual(state.queries[0].filters, [
-    ["id", "123e4567-e89b-12d3-a456-426614174000"],
-    ["user_id", "user-a"],
-  ]);
+  assert.deepEqual(state.queries[0].where, {
+    id: "123e4567-e89b-12d3-a456-426614174000",
+    userId: "user-a",
+  });
   assert.equal(state.quotaCalls.length, 0);
   assert.equal(provider.calls.length, 0);
 });
@@ -1837,12 +1845,12 @@ test("loads only the verified owner's business and bounded service list", async 
   const response = await post({ projectId: "123e4567-e89b-12d3-a456-426614174000" });
   assert.equal(response.status, 200);
   const businessQuery = state.queries.find((query) => query.table === "businesses");
-  assert.deepEqual(businessQuery.filters, [
-    ["id", "business-a"],
-    ["user_id", "user-a"],
-  ]);
+  assert.deepEqual(businessQuery.where, {
+    id: "business-a",
+    userId: "user-a",
+  });
   const serviceQuery = state.queries.find((query) => query.table === "services");
-  assert.deepEqual(serviceQuery.filters, [["business_id", "business-a"]]);
+  assert.deepEqual(serviceQuery.where, { businessId: "business-a" });
   assert.equal(state.servicesLimit, 8);
   const sentContext = JSON.parse(provider.calls[0].input).untrusted_business_project_and_service_data;
   assert.equal(sentContext.business.name, "Studio A");
@@ -2023,7 +2031,7 @@ test("reserves a daily attempt atomically before invoking the selected provider"
   assert.equal(response.status, 200);
   assert.deepEqual(state.quotaCalls, [{
     name: "reserve_daily_generation_attempt",
-    args: undefined,
+    args: "user-a",
   }]);
   assert.deepEqual(state.events, ["reservation", "provider"]);
   assert.equal(provider.calls[0].name, "gemini");
@@ -2076,7 +2084,7 @@ test("reservation errors and malformed RPC results fail closed without leaking d
   }
 
   for (const overrides of [
-    { quotaError: { message: "private database detail" } },
+    { quotaError: new Error("private database detail") },
     { quotaRpcThrows: true },
     { quotaMalformedEnvelope: true },
   ]) {
@@ -2098,19 +2106,19 @@ test("successful generation owner-scopes persistence, records metadata, and leav
   assert.deepEqual(state.events, ["reservation", "provider"]);
   assert.equal(state.projectUpdate.content, provider.result.outputText);
   assert.ok(state.projectUpdate.prompt);
-  assert.ok(state.projectUpdate.updated_at);
+  assert.ok(state.projectUpdate.updatedAt instanceof Date);
   assert.equal(Object.hasOwn(state.projectUpdate, "status"), false);
   const updateQuery = state.queries.find((query) => query.table === "projects" && query.action === "update");
-  assert.deepEqual(updateQuery.filters, [
-    ["id", "project-a"],
-    ["user_id", "user-a"],
-    ["updated_at", "2026-10-09T10:00:00.000Z"],
-  ]);
+  assert.deepEqual(updateQuery.where, {
+    id: "project-a",
+    userId: "user-a",
+    updatedAt: new Date("2026-10-09T10:00:00.000Z"),
+  });
   assert.deepEqual(state.generationInsert, {
-    project_id: "project-a",
+    projectId: "project-a",
     model: "gpt-4.1-mini",
-    input_tokens: 120,
-    output_tokens: 30,
+    inputTokens: 120,
+    outputTokens: 30,
   });
   const result = await responseJson(response);
   assert.equal(result.generation.metadataRecorded, true);
@@ -2123,10 +2131,10 @@ test("handles missing token counts and reports metadata-insert partial success",
   provider.result.outputTokens = null;
   let response = await post({ projectId: "123e4567-e89b-12d3-a456-426614174000" });
   assert.equal(response.status, 200);
-  assert.equal(state.generationInsert.input_tokens, null);
-  assert.equal(state.generationInsert.output_tokens, null);
+  assert.equal(state.generationInsert.inputTokens, null);
+  assert.equal(state.generationInsert.outputTokens, null);
 
-  reset({ generationError: { message: "private database detail" } });
+  reset({ generationError: new Error("private database detail") });
   response = await post({ projectId: "123e4567-e89b-12d3-a456-426614174000" });
   assert.equal(response.status, 200);
   assert.ok(state.projectUpdate);
@@ -2134,7 +2142,7 @@ test("handles missing token counts and reports metadata-insert partial success",
 });
 
 test("does not insert metadata when the owned project update fails", async () => {
-  reset({ updateError: { message: "private database detail" } });
+  reset({ updateError: new Error("private database detail") });
   const response = await post({ projectId: "123e4567-e89b-12d3-a456-426614174000" });
   assert.equal(response.status, 500);
   assert.equal(state.quotaCalls.length, 1);
@@ -2142,28 +2150,23 @@ test("does not insert metadata when the owned project update fails", async () =>
   assert.doesNotMatch(await response.text(), /private database detail/);
 });
 
-test("migration defines an atomic five-attempt UTC reservation with authenticated-only RPC access", () => {
+test("Prisma schema and quota query enforce atomic five-attempt UTC reservation", () => {
   const migration = fs.readFileSync(
-    path.join(root, "supabase/migrations/0003_generation_usage_limits.sql"),
+    path.join(root, "prisma/migrations/0001_init/migration.sql"),
+    "utf8",
+  );
+  const quotaSource = fs.readFileSync(
+    path.join(root, "lib/projects/quota.ts"),
     "utf8",
   );
 
-  assert.match(migration, /primary key\s*\(user_id,\s*usage_date_utc\)/i);
-  assert.match(migration, /references auth\.users\(id\) on delete cascade/i);
-  assert.match(migration, /check \(attempts between 0 and 5\)/i);
-  assert.match(migration, /security definer/i);
-  assert.match(migration, /set search_path = pg_catalog, auth/i);
-  assert.match(migration, /auth\.uid\(\)/i);
-  assert.match(migration, /statement_timestamp\(\) at time zone 'UTC'/i);
-  assert.match(migration, /\(v_usage_date \+ 1\)::timestamp at time zone 'UTC'/i);
-  assert.match(migration, /on conflict \(user_id, usage_date_utc\)/i);
-  assert.match(migration, /where daily_usage\.attempts < 5/i);
-  assert.match(migration, /returning daily_usage\.attempts into v_attempts/i);
-  assert.match(migration, /owner to postgres/i);
-  assert.match(migration, /from public, anon, authenticated, service_role/i);
-  assert.match(migration, /from public, anon, service_role/i);
-  assert.match(migration, /to authenticated/i);
-  assert.doesNotMatch(migration, /create policy[\s\S]*generation_daily_usage/i);
+  assert.match(migration, /PRIMARY KEY\s*\("user_id",\s*"usage_date_utc"\)/i);
+  assert.match(migration, /FOREIGN KEY \("user_id"\) REFERENCES "users"\("id"\) ON DELETE CASCADE/i);
+  assert.match(migration, /CHECK \("attempts" BETWEEN 0 AND 5\)/i);
+  assert.match(quotaSource, /AT TIME ZONE 'UTC'\)::date/i);
+  assert.match(quotaSource, /ON CONFLICT \("user_id", "usage_date_utc"\)/i);
+  assert.match(quotaSource, /WHERE "generation_daily_usage"\."attempts" </i);
+  assert.match(quotaSource, /RETURNING/i);
 });
 
 test("does not persist generated output or metadata when content changes during generation", async () => {
@@ -2189,10 +2192,7 @@ test("does not persist generated output or metadata when content changes during 
     assert.equal(state.quotaCalls.length, 1);
     assert.equal((await responseJson(response)).error.code, "project_content_conflict");
     assert.equal(state.generationInsert, null);
-    assert.deepEqual(state.projectUpdateFilters.at(-1), [
-      "updated_at",
-      "2026-10-09T10:00:00.000Z",
-    ]);
+    assert.deepEqual(state.projectUpdateWhere.updatedAt, new Date("2026-10-09T10:00:00.000Z"));
   } finally {
     provider.result = providerResult;
   }

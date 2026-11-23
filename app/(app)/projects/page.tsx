@@ -2,7 +2,8 @@ import Link from "next/link";
 
 import { ProjectForm } from "@/components/projects/project-form";
 import { Card } from "@/components/ui/card";
-import { createClient } from "@/lib/supabase/server";
+import { getSession } from "@/lib/auth/session";
+import { prisma } from "@/lib/db/prisma";
 
 function getProjectTypeLabel(type: unknown): string {
   switch (type) {
@@ -22,21 +23,20 @@ function getProjectTypeLabel(type: unknown): string {
 export const dynamic = "force-dynamic";
 
 export default async function ProjectsPage() {
-  const supabase = await createClient();
-  const { data: claims, error: claimsError } = await supabase.auth.getClaims();
-  const userId = typeof claims?.claims?.sub === "string" ? claims.claims.sub : null;
+  const session = await getSession();
+  const userId = session?.userId ?? null;
 
-  if (claimsError || !userId) {
+  if (!userId) {
     return <p role="alert" className="text-sm text-error">Your session has expired. Please sign in again.</p>;
   }
 
-  const { data: business, error: businessError } = await supabase
-    .from("businesses")
-    .select("id")
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  if (businessError) {
+  let business: { id: string } | null;
+  try {
+    business = await prisma.business.findUnique({
+      where: { userId },
+      select: { id: true },
+    });
+  } catch {
     return <p role="alert" className="text-sm text-error">We could not check your business profile. Please try again.</p>;
   }
 
@@ -59,14 +59,22 @@ export default async function ProjectsPage() {
     );
   }
 
-  const { data: projects, error: projectsError } = await supabase
-    .from("projects")
-    .select("id, type, goal, title, status, created_at, updated_at")
-    .eq("user_id", userId)
-    .order("updated_at", { ascending: false })
-    .order("created_at", { ascending: false });
-
-  if (projectsError) {
+  let projects;
+  try {
+    projects = await prisma.project.findMany({
+      where: { userId },
+      orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
+      select: {
+        id: true,
+        type: true,
+        goal: true,
+        title: true,
+        status: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+  } catch {
     return <p role="alert" className="text-sm text-error">We could not load your projects. Please try again.</p>;
   }
 
@@ -89,6 +97,9 @@ export default async function ProjectsPage() {
         <div className="space-y-3">
           {projects.map((project) => {
             const typeLabel = getProjectTypeLabel(project.type);
+            const createdAtIso = project.createdAt instanceof Date
+              ? project.createdAt.toISOString()
+              : String(project.createdAt);
             return (
               <Card key={project.id}>
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -103,8 +114,8 @@ export default async function ProjectsPage() {
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted">
                     <span>{typeLabel}</span>
                     <span className="capitalize">{project.status}</span>
-                    <time dateTime={project.created_at}>
-                      Created {new Date(project.created_at).toLocaleDateString()}
+                    <time dateTime={createdAtIso}>
+                      Created {new Date(createdAtIso).toLocaleDateString()}
                     </time>
                   </div>
                 </div>

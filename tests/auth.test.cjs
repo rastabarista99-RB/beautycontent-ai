@@ -29,40 +29,39 @@ class RedirectSignal extends Error {
   }
 }
 
-const auth = {
-  async signUp(input) {
-    state.signUpCalls.push(input);
-    return state.signUpResult;
-  },
-  async signInWithPassword(input) {
-    state.signInCalls.push(input);
-    return state.signInResult;
-  },
-  async signOut() {
-    state.signOutCalls += 1;
-    return state.signOutResult;
-  },
-  async verifyOtp(input) {
-    state.verifyOtpCalls.push(input);
-    return state.verifyOtpHandler(input);
-  },
-};
-
-const supabase = { auth };
 const originalLoad = Module._load;
 
 Module._load = function (request, parent, isMain) {
-  if (request === "@/lib/supabase/server") {
+  if (request === "server-only") {
+    return {};
+  }
+  if (request === "@/lib/db/prisma") {
     return {
-      createClient: async () => {
-        state.createClientCalls += 1;
-        return supabase;
+      prisma: {
+        user: {
+          async findUnique(args) {
+            state.findUniqueCalls.push(args);
+            if (state.findUniqueError) throw state.findUniqueError;
+            return state.existingUser;
+          },
+          async create(args) {
+            state.createCalls.push(args);
+            if (state.createError) throw state.createError;
+            return state.createdUser;
+          },
+        },
       },
     };
   }
-  if (request === "next/headers") {
+  if (request === "@/lib/auth/session") {
     return {
-      headers: async () => new Headers(state.origin ? { origin: state.origin } : {}),
+      async setSessionCookie(user) {
+        state.sessionCookieUsers.push(user);
+        if (state.setCookieError) throw state.setCookieError;
+      },
+      async clearSessionCookie() {
+        state.clearCookieCalls += 1;
+      },
     };
   }
   if (request === "next/cache") {
@@ -79,37 +78,30 @@ Module._load = function (request, parent, isMain) {
       },
     };
   }
-  if (request === "next/server") {
-    return {
-      NextResponse: {
-        redirect(destination) {
-          return new Response(null, {
-            status: 307,
-            headers: { location: String(destination) },
-          });
-        },
-      },
-    };
+  if (request.startsWith("@/")) {
+    const modulePath = path.join(root, request.slice(2));
+    return originalLoad(`${modulePath}.ts`, parent, isMain);
   }
   return originalLoad.call(this, request, parent, isMain);
 };
 
 const { signIn, signOut, signUp } = require(path.join(root, "lib", "auth", "actions.ts"));
-const { GET } = require(path.join(root, "app", "auth", "confirm", "route.ts"));
+const { hashPassword, verifyPassword } = require(path.join(root, "lib", "auth", "password.ts"));
+const { signSessionToken, verifySessionToken } = require(path.join(root, "lib", "auth", "session-token.ts"));
 
 test.beforeEach(() => {
+  process.env.AUTH_SECRET = "test-secret-with-at-least-32-characters";
   Object.assign(state, {
-    createClientCalls: 0,
-    origin: "https://beautycontent.example",
+    findUniqueCalls: [],
+    findUniqueError: null,
+    existingUser: null,
+    createCalls: [],
+    createError: null,
+    createdUser: { id: "user-1", email: "user@example.com" },
+    sessionCookieUsers: [],
+    setCookieError: null,
+    clearCookieCalls: 0,
     revalidatedPaths: [],
-    signInCalls: [],
-    signInResult: { error: null },
-    signOutCalls: 0,
-    signOutResult: { error: null },
-    signUpCalls: [],
-    signUpResult: { error: null },
-    verifyOtpCalls: [],
-    verifyOtpHandler: async () => ({ error: null }),
   });
 });
 
@@ -129,7 +121,30 @@ async function assertRedirect(promise, destination) {
   });
 }
 
-test("rejects invalid registration inputs before calling Supabase", async () => {
+test("hashes and verifies passwords safely with scrypt", async () => {
+  const hash = await hashPassword("secret123");
+  assert.match(hash, /^scrypt\$[0-9a-f]+\$[0-9a-f]+$/);
+  assert.equal(await verifyPassword("secret123", hash), true);
+  assert.equal(await verifyPassword("wrong-password", hash), false);
+  assert.equal(await verifyPassword("secret123", "malformed-hash"), false);
+});
+
+test("signs and verifies HMAC session tokens and rejects tampered or expired tokens", async () => {
+  const token = await signSessionToken({ userId: "user-1", email: "user@example.com" });
+  const verified = await verifySessionToken(token);
+  assert.equal(verified.sub, "user-1");
+  assert.equal(verified.email, "user@example.com");
+  assert.ok(verified.exp > Math.floor(Date.now() / 1000));
+
+  const tampered = `${token.slice(0, -1)}${token.endsWith("a") ? "b" : "a"}`;
+  assert.equal(await verifySessionToken(tampered), null);
+  assert.equal(await verifySessionToken(undefined), null);
+
+  process.env.AUTH_SECRET = "short";
+  assert.equal(await verifySessionToken(token), null);
+});
+
+test("rejects invalid registration inputs before querying Postgres", async () => {
   const cases = [
     [{ email: "not-an-email", password: "secret1", confirmPassword: "secret1" }, "valid email"],
     [{ email: "user@example.com", password: "short", confirmPassword: "short" }, "at least 6"],
@@ -141,221 +156,104 @@ test("rejects invalid registration inputs before calling Supabase", async () => 
     assert.match(result.error, new RegExp(expectedMessage, "i"));
   }
 
-  assert.equal(state.createClientCalls, 0);
-  assert.equal(state.signUpCalls.length, 0);
+  assert.equal(state.findUniqueCalls.length, 0);
+  assert.equal(state.createCalls.length, 0);
 });
 
-test("registers successfully with normalized email and the confirmation callback URL", async () => {
-  const result = await signUp({}, form({
+test("registers successfully with normalized email, hashes password, sets session cookie, and redirects", async () => {
+  await assertRedirect(signUp({}, form({
     email: "  User@Example.com ",
     password: "secret1",
     confirmPassword: "secret1",
-  }));
+  })), "/dashboard");
 
-  assert.deepEqual(result, { success: true });
-  assert.deepEqual(state.signUpCalls, [{
-    email: "user@example.com",
-    password: "secret1",
-    options: { emailRedirectTo: "https://beautycontent.example/auth/confirm" },
-  }]);
+  assert.equal(state.findUniqueCalls[0].where.email, "user@example.com");
+  assert.equal(state.createCalls[0].data.email, "user@example.com");
+  assert.match(state.createCalls[0].data.passwordHash, /^scrypt\$/);
+  assert.deepEqual(state.sessionCookieUsers, [{ id: "user-1", email: "user@example.com" }]);
+  assert.deepEqual(state.revalidatedPaths, [["/", "layout"]]);
 });
 
-test("registration omits the confirmation URL when the request has no Origin", async () => {
-  state.origin = "";
-
-  const result = await signUp({}, form({
+test("maps existing-email and Prisma P2002 errors to the account-exists response", async () => {
+  state.existingUser = { id: "existing-id" };
+  let result = await signUp({}, form({
     email: "user@example.com",
     password: "secret1",
     confirmPassword: "secret1",
   }));
-
-  assert.deepEqual(result, { success: true });
-  assert.deepEqual(state.signUpCalls[0], {
-    email: "user@example.com",
-    password: "secret1",
-    options: undefined,
+  assert.deepEqual(result, {
+    error: "An account with this email already exists. Try signing in.",
   });
-});
 
-test("returns a generic registration message for Supabase signup errors", async () => {
-  state.signUpResult = { error: { message: "provider unavailable" } };
-
-  const result = await signUp({}, form({
+  state.existingUser = null;
+  state.createError = Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
+  result = await signUp({}, form({
     email: "user@example.com",
     password: "secret1",
     confirmPassword: "secret1",
   }));
-
-  assert.deepEqual(result, { error: "We could not complete that request. Please try again." });
-});
-
-test("maps an existing-email signup error to the account-exists response", async () => {
-  state.signUpResult = { error: { message: "User already registered" } };
-
-  const result = await signUp({}, form({
-    email: "user@example.com",
-    password: "secret1",
-    confirmPassword: "secret1",
-  }));
-
   assert.deepEqual(result, {
     error: "An account with this email already exists. Try signing in.",
   });
 });
 
-test("processes repeated registration submissions as separate Supabase requests", async () => {
-  const registration = form({
+test("returns a generic registration message for unexpected database errors", async () => {
+  state.createError = new Error("connection refused");
+  const result = await signUp({}, form({
     email: "user@example.com",
     password: "secret1",
     confirmPassword: "secret1",
-  });
-
-  assert.deepEqual(await signUp({}, registration), { success: true });
-  assert.deepEqual(await signUp({}, registration), { success: true });
-  assert.equal(state.signUpCalls.length, 2);
+  }));
+  assert.deepEqual(result, { error: "We could not complete that request. Please try again." });
 });
 
-test("rejects invalid login input before calling Supabase", async () => {
+test("rejects invalid login input before querying Postgres", async () => {
   const invalidEmail = await signIn({}, form({ email: "invalid", password: "secret1" }));
   const missingPassword = await signIn({}, form({ email: "user@example.com", password: "" }));
 
   assert.deepEqual(invalidEmail, { error: "Enter a valid email address and password." });
   assert.deepEqual(missingPassword, { error: "Enter a valid email address and password." });
-  assert.equal(state.createClientCalls, 0);
-  assert.equal(state.signInCalls.length, 0);
+  assert.equal(state.findUniqueCalls.length, 0);
 });
 
-test("logs in with normalized email, revalidates the layout, and redirects to dashboard", async () => {
+test("logs in with normalized email, verifies password, sets cookie, and redirects to dashboard", async () => {
+  state.existingUser = {
+    id: "user-1",
+    email: "user@example.com",
+    passwordHash: await hashPassword("secret1"),
+  };
+
   await assertRedirect(signIn({}, form({
     email: "  User@Example.com ",
     password: "secret1",
   })), "/dashboard");
 
-  assert.deepEqual(state.signInCalls, [{ email: "user@example.com", password: "secret1" }]);
+  assert.equal(state.findUniqueCalls[0].where.email, "user@example.com");
+  assert.deepEqual(state.sessionCookieUsers, [{ id: "user-1", email: "user@example.com" }]);
   assert.deepEqual(state.revalidatedPaths, [["/", "layout"]]);
 });
 
-test("maps invalid credentials to a safe response", async () => {
-  state.signInResult = { error: { message: "Invalid login credentials", status: 400 } };
+test("maps unknown users and wrong passwords to invalid credentials response", async () => {
+  let result = await signIn({}, form({ email: "user@example.com", password: "incorrect" }));
+  assert.deepEqual(result, { error: "The email or password is incorrect." });
 
-  const result = await signIn({}, form({ email: "user@example.com", password: "incorrect" }));
-
+  state.existingUser = {
+    id: "user-1",
+    email: "user@example.com",
+    passwordHash: await hashPassword("correct-password"),
+  };
+  result = await signIn({}, form({ email: "user@example.com", password: "incorrect" }));
   assert.deepEqual(result, { error: "The email or password is incorrect." });
 });
 
-test("maps an unconfirmed email error to the confirmation response", async () => {
-  state.signInResult = { error: { message: "Email not confirmed", status: 400 } };
-
+test("uses a generic login response for unexpected database errors", async () => {
+  state.findUniqueError = new Error("database details");
   const result = await signIn({}, form({ email: "user@example.com", password: "secret1" }));
-
-  assert.deepEqual(result, { error: "Please confirm your email before signing in." });
-});
-
-test("uses a generic login response for unexpected Supabase errors", async () => {
-  state.signInResult = { error: { message: "database details", status: 500 } };
-
-  const result = await signIn({}, form({ email: "user@example.com", password: "secret1" }));
-
   assert.deepEqual(result, { error: "We could not complete that request. Please try again." });
 });
 
-test("processes repeated login submissions as separate Supabase requests", async () => {
-  const credentials = form({ email: "user@example.com", password: "secret1" });
-
-  await assertRedirect(signIn({}, credentials), "/dashboard");
-  await assertRedirect(signIn({}, credentials), "/dashboard");
-  assert.equal(state.signInCalls.length, 2);
-});
-
-test("logs out successfully, revalidates the layout, and redirects to login", async () => {
+test("logs out by clearing the session cookie, revalidating layout, and redirecting to login", async () => {
   await assertRedirect(signOut(), "/login");
-
-  assert.equal(state.signOutCalls, 1);
+  assert.equal(state.clearCookieCalls, 1);
   assert.deepEqual(state.revalidatedPaths, [["/", "layout"]]);
-});
-
-test("surfaces logout failure without revalidation or redirect", async () => {
-  state.signOutResult = { error: { message: "logout failed" } };
-
-  await assert.rejects(signOut(), { message: "Unable to sign out." });
-
-  assert.equal(state.signOutCalls, 1);
-  assert.deepEqual(state.revalidatedPaths, []);
-});
-
-test("processes repeated logout submissions as separate Supabase requests", async () => {
-  await assertRedirect(signOut(), "/login");
-  await assertRedirect(signOut(), "/login");
-
-  assert.equal(state.signOutCalls, 2);
-  assert.deepEqual(state.revalidatedPaths, [["/", "layout"], ["/", "layout"]]);
-});
-
-test("confirmation rejects missing parameters and unsupported token types", async (t) => {
-  const cases = [
-    ["missing token hash", "https://beautycontent.example/auth/confirm?type=signup"],
-    ["missing type", "https://beautycontent.example/auth/confirm?token_hash=valid-token"],
-    ["unsupported type", "https://beautycontent.example/auth/confirm?token_hash=valid-token&type=unsupported"],
-  ];
-
-  for (const [name, url] of cases) {
-    await t.test(name, async () => {
-      const response = await GET(new Request(url));
-
-      assert.equal(response.status, 307);
-      assert.equal(
-        response.headers.get("location"),
-        "https://beautycontent.example/error?reason=confirmation",
-      );
-    });
-  }
-
-  assert.equal(state.createClientCalls, 0);
-  assert.equal(state.verifyOtpCalls.length, 0);
-});
-
-test("confirmation verifies an allowed token and redirects to dashboard", async () => {
-  const response = await GET(new Request(
-    "https://beautycontent.example/auth/confirm?token_hash=valid-token&type=signup&next=https%3A%2F%2Fevil.example",
-  ));
-
-  assert.equal(response.status, 307);
-  assert.equal(response.headers.get("location"), "https://beautycontent.example/dashboard");
-  assert.deepEqual(state.verifyOtpCalls, [{ type: "signup", token_hash: "valid-token" }]);
-});
-
-test("confirmation maps a failed OTP verification to the fixed error destination", async () => {
-  state.verifyOtpHandler = async () => ({ error: { message: "expired token details" } });
-
-  const response = await GET(new Request(
-    "https://beautycontent.example/auth/confirm?token_hash=expired-token&type=recovery",
-  ));
-
-  assert.equal(response.status, 307);
-  assert.equal(
-    response.headers.get("location"),
-    "https://beautycontent.example/error?reason=confirmation",
-  );
-  assert.deepEqual(state.verifyOtpCalls, [{ type: "recovery", token_hash: "expired-token" }]);
-});
-
-test("repeated confirmation callbacks are verified independently", async () => {
-  let attempts = 0;
-  state.verifyOtpHandler = async () => {
-    attempts += 1;
-    return attempts === 1 ? { error: null } : { error: { message: "already used" } };
-  };
-  const request = new Request(
-    "https://beautycontent.example/auth/confirm?token_hash=one-time-token&type=signup",
-  );
-
-  const firstResponse = await GET(request.clone());
-  const secondResponse = await GET(request.clone());
-
-  assert.equal(firstResponse.headers.get("location"), "https://beautycontent.example/dashboard");
-  assert.equal(
-    secondResponse.headers.get("location"),
-    "https://beautycontent.example/error?reason=confirmation",
-  );
-  assert.equal(state.verifyOtpCalls.length, 2);
 });

@@ -1,36 +1,40 @@
 # BeautyContent AI
 
-Initial Phase 01 foundation for the BeautyContent AI PWA.
+AI marketing assistant for beauty businesses, backed by PostgreSQL, Prisma ORM, and Docker.
 
 ## Prerequisites
 
-- Node.js 20.9 or newer
-- npm
+- Docker & Docker Compose
+- Node.js 22+ and npm (if running Next.js directly on host)
 
-## Local setup
+## Standard PostgreSQL Docker settings
 
-1. Install dependencies:
+- **Image**: `postgres:16`
+- **Host / Port**: `localhost:5432`
+- **User**: `postgres`
+- **Password**: `postgres`
+- **Database**: `postgres`
+
+## Quick start
+
+1. Copy `.env.example` to `.env` and set `AUTH_SECRET` plus your AI key (`OPENAI_API_KEY` or `GEMINI_API_KEY` with `AI_PROVIDER=gemini`):
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Start PostgreSQL with Docker Compose:
+
+   ```bash
+   docker compose up -d
+   ```
+
+3. Install dependencies, apply Prisma migrations, and start the app:
 
    ```bash
    npm install
-   ```
-
-2. Copy `.env.example` to `.env.local` and configure Supabase plus one generation provider. Set `AI_PROVIDER=gemini` with `GEMINI_API_KEY` to use Gemini, or `AI_PROVIDER=openai` with `OPENAI_API_KEY` to use OpenAI. If `AI_PROVIDER` is unset, generation continues to use OpenAI.
-
-3. Start the development server:
-
-   ```bash
+   npx prisma migrate deploy
    npm run dev
    ```
 
-Open [http://localhost:3000](http://localhost:3000).
-
-## Verification
-
-```bash
-npm run typecheck
-npm run lint
-npm run build
-```
-
-Gemini generation uses Google's Gemini API and the `gemini-3.5-flash-lite` model. Free-tier availability and rate limits apply. This integration does not configure paid billing, tools, or external actions.
+   Open [http://localhost:3000](http://localhost:3000).

@@ -3,7 +3,8 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
-import { createClient } from "@/lib/supabase/server";
+import { getSession } from "@/lib/auth/session";
+import { prisma } from "@/lib/db/prisma";
 
 export type ProjectActionState = {
   error?: string;
@@ -57,15 +58,12 @@ function validateProjectInput(formData: FormData): ProjectInput | { error: strin
 }
 
 async function getAuthenticatedUserId(): Promise<{ id: string } | { error: string }> {
-  const supabase = await createClient();
-  const { data: claims, error: claimsError } = await supabase.auth.getClaims();
-  const userId = typeof claims?.claims?.sub === "string" ? claims.claims.sub : null;
-
-  if (claimsError || !userId) {
+  const session = await getSession();
+  if (!session?.userId) {
     return { error: "Your session has expired. Please sign in again." };
   }
 
-  return { id: userId };
+  return { id: session.userId };
 }
 
 export async function createProject(
@@ -78,15 +76,13 @@ export async function createProject(
   const input = validateProjectInput(formData);
   if ("error" in input) return input;
 
-  const supabase = await createClient();
-
-  const { data: business, error: businessError } = await supabase
-    .from("businesses")
-    .select("id")
-    .eq("user_id", user.id)
-    .maybeSingle();
-
-  if (businessError) {
+  let business: { id: string } | null;
+  try {
+    business = await prisma.business.findUnique({
+      where: { userId: user.id },
+      select: { id: true },
+    });
+  } catch {
     return { error: "We could not verify your Business Profile. Please try again." };
   }
 
@@ -94,13 +90,15 @@ export async function createProject(
     return { error: "Create a Business Profile before creating a project." };
   }
 
-  const { error: insertError } = await supabase.from("projects").insert({
-    user_id: user.id,
-    business_id: business.id,
-    ...input,
-  });
-
-  if (insertError) {
+  try {
+    await prisma.project.create({
+      data: {
+        userId: user.id,
+        businessId: business.id,
+        ...input,
+      },
+    });
+  } catch {
     return { error: "We could not create your project. Please try again." };
   }
 
@@ -123,21 +121,17 @@ export async function updateProject(
   const input = validateProjectInput(formData);
   if ("error" in input) return input;
 
-  const supabase = await createClient();
-  const { data: updatedProject, error } = await supabase
-    .from("projects")
-    .update({ ...input, updated_at: new Date().toISOString() })
-    .eq("id", projectId)
-    .eq("user_id", user.id)
-    .select("id")
-    .maybeSingle();
+  try {
+    const updated = await prisma.project.updateMany({
+      where: { id: projectId, userId: user.id },
+      data: { ...input, updatedAt: new Date() },
+    });
 
-  if (error) {
+    if (updated.count === 0) {
+      return { error: "This project is no longer available." };
+    }
+  } catch {
     return { error: "We could not update your project. Please try again." };
-  }
-
-  if (!updatedProject) {
-    return { error: "This project is no longer available." };
   }
 
   revalidatePath("/projects");
@@ -157,21 +151,16 @@ export async function deleteProject(
     return { error: "This project is no longer available." };
   }
 
-  const supabase = await createClient();
-  const { data: deletedProject, error } = await supabase
-    .from("projects")
-    .delete()
-    .eq("id", projectId)
-    .eq("user_id", user.id)
-    .select("id")
-    .maybeSingle();
+  try {
+    const deleted = await prisma.project.deleteMany({
+      where: { id: projectId, userId: user.id },
+    });
 
-  if (error) {
+    if (deleted.count === 0) {
+      return { error: "This project is no longer available." };
+    }
+  } catch {
     return { error: "We could not delete your project. Please try again." };
-  }
-
-  if (!deletedProject) {
-    return { error: "This project is no longer available." };
   }
 
   revalidatePath("/projects");
